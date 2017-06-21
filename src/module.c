@@ -185,96 +185,217 @@ int MGraph_AddEdge(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
 
 /* Retrives node
  * argv[1] graph name
- * argv[2] node id
+ * argv[2] list of node ids
  * returns node attributes plus label if exists */
-int MGraph_GetNode(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
-    if(argc != 3) {
+int MGraph_GetNodes(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    if(argc < 2) {
         return RedisModule_WrongArity(ctx);
     }
     
-    RedisModuleString *graph;
-    RedisModuleString *nodeId;
-    
-    RMUtil_ParseArgs(argv, argc, 1, "ss", &graph, &nodeId);
-    const char *strNodeId = RedisModule_StringPtrLen(nodeId, NULL);
-
+    Node *node;
+    char *nodeId;
+    tm_len_t nodeIdLen;
+    int replayElementCount = 1; // Total number of elements returned in response
+    RedisModuleString *graph = argv[1];
     Store *nodeStore = GetStore(ctx, STORE_NODE, graph, NULL);
-    Node *node = Store_Get(nodeStore, strNodeId);
+    
+    /* Collect ids
+     * User did not specified node id(s)
+     * return all nodes */
 
-    if(node == NULL) {
-        RedisModule_ReplyWithStringBuffer(ctx, "Missing node", strlen("Missing node"));
-        return REDISMODULE_OK;
+    // We're not sure of response size
+    RedisModule_ReplyWithArray(ctx, REDISMODULE_POSTPONED_ARRAY_LEN);
+    if(argc == 2) {
+        StoreIterator *it = Store_Search(nodeStore, "");
+        while(StoreIterator_Next(it, &nodeId, &nodeIdLen, &node)) {
+            RedisModuleString *id = RedisModule_CreateString(ctx, nodeId, nodeIdLen);
+            RMUtilInfo *attributes = RMUtil_HGetAll(ctx, id);
+            RedisModule_FreeString(ctx, id);
+
+            // Compute number of attribute this node will take from the output.
+            int nodeAttributesCount = attributes->numEntries*2+2; // attributes + id.
+            if(node->label != NULL) {
+                nodeAttributesCount+=2; // node has a label
+            }
+            
+            replayElementCount += nodeAttributesCount + 1; // account for node attributes count.
+
+            // Mark number of attributes this node have.
+            RedisModule_ReplyWithDouble(ctx, nodeAttributesCount);
+
+            // Add node id to output
+            RedisModule_ReplyWithStringBuffer(ctx, "id", 2);
+            RedisModule_ReplyWithStringBuffer(ctx, nodeId, nodeIdLen);
+            
+            // Add node label to output
+            if(node->label != NULL) {
+                RedisModule_ReplyWithStringBuffer(ctx, "label", 5);
+                RedisModule_ReplyWithStringBuffer(ctx, node->label, strlen(node->label));
+            }
+            
+            // Add node attributes to output
+            for(int i = 0; i < attributes->numEntries; i++) {
+                RMUtilInfoEntry entry = attributes->entries[i];
+                RedisModule_ReplyWithStringBuffer(ctx, entry.key, strlen(entry.key));
+                RedisModule_ReplyWithStringBuffer(ctx, entry.val, strlen(entry.val));
+            }
+            RMUtilRedisInfo_Free(attributes);
+        }
+        // Replay ends with the number of nodes in it.
+        RedisModule_ReplyWithDouble(ctx, Store_Cardinality(nodeStore));
+        StoreIterator_Free(it);
+    } else {
+        int nodesRetrieved = 0;
+        for(int i = 2; i < argc; i++) {
+            RedisModuleString *rmNodeId = argv[i];
+            nodeId = RedisModule_StringPtrLen(rmNodeId, NULL);
+            node = Store_Get(nodeStore, nodeId);
+
+            if(node == NULL) {
+                continue;
+            }
+            nodesRetrieved++;
+            
+            RMUtilInfo *attributes = RMUtil_HGetAll(ctx, rmNodeId);
+
+            // Compute number of attribute this node will take from the output.
+            int nodeAttributesCount = attributes->numEntries*2+2; // attributes + id.
+            if(node->label != NULL) {
+                nodeAttributesCount+=2; // node has a label
+            }
+            
+            replayElementCount += nodeAttributesCount + 1; // account for node attributes count.
+
+            // Mark number of attributes this node have.
+            RedisModule_ReplyWithDouble(ctx, nodeAttributesCount);
+
+            // Add node id to output
+            RedisModule_ReplyWithStringBuffer(ctx, "id", 2);
+            RedisModule_ReplyWithStringBuffer(ctx, node->id, strlen(node->id));
+            
+            // Add node label to output
+            if(node->label != NULL) {
+                RedisModule_ReplyWithStringBuffer(ctx, "label", 5);
+                RedisModule_ReplyWithStringBuffer(ctx, node->label, strlen(node->label));
+            }
+            
+            // Add node attributes to output
+            for(int i = 0; i < attributes->numEntries; i++) {
+                RMUtilInfoEntry entry = attributes->entries[i];
+                RedisModule_ReplyWithStringBuffer(ctx, entry.key, strlen(entry.key));
+                RedisModule_ReplyWithStringBuffer(ctx, entry.val, strlen(entry.val));
+            }
+            RMUtilRedisInfo_Free(attributes);
+        }
+        // Replay ends with the number of nodes in it.
+        RedisModule_ReplyWithDouble(ctx, nodesRetrieved);
     }
 
-    RMUtilInfo *attributes = RMUtil_HGetAll(ctx, nodeId);
-    
-    int responseLength = attributes->numEntries * 2;
-    if(node->label != NULL) {
-        responseLength += 2;
-    }
-
-    RedisModule_ReplyWithArray(ctx, responseLength);
-    
-    if(node->label != NULL) {
-        RedisModule_ReplyWithStringBuffer(ctx, "label", 5);
-        RedisModule_ReplyWithStringBuffer(ctx, node->label, strlen(node->label));
-    }
-    
-    for(int i = 0; i < attributes->numEntries; i++) {
-        RMUtilInfoEntry entry = attributes->entries[i];
-        RedisModule_ReplyWithStringBuffer(ctx, entry.key, strlen(entry.key));
-        RedisModule_ReplyWithStringBuffer(ctx, entry.val, strlen(entry.val));
-    }
-    
+    RedisModule_ReplySetArrayLength(ctx, replayElementCount);
     return REDISMODULE_OK;
 }
 
 /* Retrives an edge
  * argv[1] graph name
- * argv[2] edge id
+ * argv[2] list of edge ids
  * returns edge attributes plus three additional:
  * source node id, dest node id and edge label */
-int MGraph_GetEdge(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
-    if(argc != 3) {
+int MGraph_GetEdges(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    if(argc < 2) {
         return RedisModule_WrongArity(ctx);
     }
     
-    RedisModuleString *graph;
-    RedisModuleString *edgeId;
-    
-    RMUtil_ParseArgs(argv, argc, 1, "ss", &graph, &edgeId);
-    const char *strEdgeId = RedisModule_StringPtrLen(edgeId, NULL);
-
+    Edge *edge;
+    char *edgeId;
+    tm_len_t edgeIdLen;
+    int replayElementCount = 1; // Total number of elements returned in response
+    RedisModuleString *graph = argv[1];
     Store *edgeStore = GetStore(ctx, STORE_EDGE, graph, NULL);
-    Edge *edge = Store_Get(edgeStore, strEdgeId);
+    
+    /* Collect ids
+     * User did not specified edge id(s)
+     * return all edges */
 
-    if(edge == NULL) {
-        RedisModule_ReplyWithStringBuffer(ctx, "Missing edge", strlen("Missing edge"));
-        return REDISMODULE_OK;
+    // We're not sure of response size
+    RedisModule_ReplyWithArray(ctx, REDISMODULE_POSTPONED_ARRAY_LEN);
+
+    if(argc == 2) {
+        StoreIterator *it = Store_Search(edgeStore, "");
+        while(StoreIterator_Next(it, &edgeId, &edgeIdLen, &edge)) {
+            RedisModuleString *id = RedisModule_CreateString(ctx, edgeId, edgeIdLen);
+            RMUtilInfo *attributes = RMUtil_HGetAll(ctx, id);
+            RedisModule_FreeString(ctx, id);
+
+            // Compute number of attribute this edge will take from the output.
+            int edgeAttributesCount = attributes->numEntries*2+2+2+4; // attributes + id + label + src,dest node ids.
+            replayElementCount += edgeAttributesCount+1; // account for edge attributes count.
+
+            // Mark number of attributes this edge have.
+            RedisModule_ReplyWithDouble(ctx, edgeAttributesCount);
+
+            // Add edge id, label to output
+            RedisModule_ReplyWithStringBuffer(ctx, "id", 2);
+            RedisModule_ReplyWithStringBuffer(ctx, edgeId, edgeIdLen);
+            RedisModule_ReplyWithStringBuffer(ctx, "label", 5);
+            RedisModule_ReplyWithStringBuffer(ctx, edge->relationship, strlen(edge->relationship));
+            RedisModule_ReplyWithStringBuffer(ctx, "src", 3);
+            RedisModule_ReplyWithStringBuffer(ctx, edge->src->id, strlen(edge->src->id));
+            RedisModule_ReplyWithStringBuffer(ctx, "dest", 4);
+            RedisModule_ReplyWithStringBuffer(ctx, edge->dest->id, strlen(edge->dest->id));
+            
+            // Add edge attributes to output
+            for(int i = 0; i < attributes->numEntries; i++) {
+                RMUtilInfoEntry entry = attributes->entries[i];
+                RedisModule_ReplyWithStringBuffer(ctx, entry.key, strlen(entry.key));
+                RedisModule_ReplyWithStringBuffer(ctx, entry.val, strlen(entry.val));
+            }
+            RMUtilRedisInfo_Free(attributes);
+        }
+        // Replay ends with the number of edges in it.
+        RedisModule_ReplyWithDouble(ctx, Store_Cardinality(edgeStore));
+        StoreIterator_Free(it);
+    } else {
+        int edgesRetrieved = 0;
+        for(int i = 2; i < argc; i++) {
+            RedisModuleString *rmEdgeId = argv[i];
+            edgeId = RedisModule_StringPtrLen(rmEdgeId, NULL);
+            edge = Store_Get(edgeStore, edgeId);
+            if(edge == NULL) {
+                continue;
+            }
+            edgesRetrieved++;
+            RMUtilInfo *attributes = RMUtil_HGetAll(ctx, rmEdgeId);
+
+            // Compute number of attribute this edge will take from the output.
+            int edgeAttributesCount = attributes->numEntries*2+2+2+4; // attributes + id + label + src,dest node ids.
+            replayElementCount += edgeAttributesCount + 1; // account for edge attributes count.
+
+            // Mark number of attributes this edge have.
+            RedisModule_ReplyWithDouble(ctx, edgeAttributesCount);
+
+            // Add edge id, label to output
+            RedisModule_ReplyWithStringBuffer(ctx, "id", 2);
+            RedisModule_ReplyWithStringBuffer(ctx, edge->id, strlen(edge->id));
+            RedisModule_ReplyWithStringBuffer(ctx, "label", 5);
+            RedisModule_ReplyWithStringBuffer(ctx, edge->relationship, strlen(edge->relationship));
+            RedisModule_ReplyWithStringBuffer(ctx, "src", 3);
+            RedisModule_ReplyWithStringBuffer(ctx, edge->src->id, strlen(edge->src->id));
+            RedisModule_ReplyWithStringBuffer(ctx, "dest", 4);
+            RedisModule_ReplyWithStringBuffer(ctx, edge->dest->id, strlen(edge->dest->id));
+            
+            // Add edge attributes to output
+            for(int i = 0; i < attributes->numEntries; i++) {
+                RMUtilInfoEntry entry = attributes->entries[i];
+                RedisModule_ReplyWithStringBuffer(ctx, entry.key, strlen(entry.key));
+                RedisModule_ReplyWithStringBuffer(ctx, entry.val, strlen(entry.val));
+            }
+            RMUtilRedisInfo_Free(attributes);
+        }
+        // Replay ends with the number of edges in it.
+        RedisModule_ReplyWithDouble(ctx, edgesRetrieved);
     }
 
-    RMUtilInfo *attributes = RMUtil_HGetAll(ctx, edgeId);
-    
-    RedisModule_ReplyWithArray(ctx, (attributes->numEntries*2)+8);
-    
-    RedisModule_ReplyWithStringBuffer(ctx, "id", 2);
-    RedisModule_ReplyWithStringBuffer(ctx, edge->id, strlen(edge->id));
-    
-    RedisModule_ReplyWithStringBuffer(ctx, "type", 4);
-    RedisModule_ReplyWithStringBuffer(ctx, edge->relationship, strlen(edge->relationship));
-
-    RedisModule_ReplyWithStringBuffer(ctx, "src", 3);
-    RedisModule_ReplyWithStringBuffer(ctx, edge->src->id, strlen(edge->src->id));
-    
-    RedisModule_ReplyWithStringBuffer(ctx, "dest", 4);
-    RedisModule_ReplyWithStringBuffer(ctx, edge->dest->id, strlen(edge->dest->id));
-
-    for(int i = 0; i < attributes->numEntries; i++) {
-        RMUtilInfoEntry entry = attributes->entries[i];
-        RedisModule_ReplyWithStringBuffer(ctx, entry.key, strlen(entry.key));
-        RedisModule_ReplyWithStringBuffer(ctx, entry.val, strlen(entry.val));
-    }
-    
+    RedisModule_ReplySetArrayLength(ctx, replayElementCount);
     return REDISMODULE_OK;
 }
 
@@ -635,11 +756,11 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
         return REDISMODULE_ERR;
     }
 
-    if(RedisModule_CreateCommand(ctx, "graph.GETNODE", MGraph_GetNode, "write", 1, 1, 1) == REDISMODULE_ERR) {
+    if(RedisModule_CreateCommand(ctx, "graph.GETNODES", MGraph_GetNodes, "write", 1, 1, 1) == REDISMODULE_ERR) {
         return REDISMODULE_ERR;
     }
 
-    if(RedisModule_CreateCommand(ctx, "graph.GETEDGE", MGraph_GetEdge, "write", 1, 1, 1) == REDISMODULE_ERR) {
+    if(RedisModule_CreateCommand(ctx, "graph.GETEDGES", MGraph_GetEdges, "write", 1, 1, 1) == REDISMODULE_ERR) {
         return REDISMODULE_ERR;
     }
 
